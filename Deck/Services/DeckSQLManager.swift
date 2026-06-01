@@ -121,6 +121,7 @@ enum Col {
     nonisolated static let uniqueId = Expression<String>("unique_id")
     nonisolated static let type = Expression<String>("type")
     nonisolated static let itemType = Expression<String>("item_type")
+    nonisolated static let isDeleted = Expression<Bool>("is_deleted")
     nonisolated static let data = Expression<Data>("data")
     nonisolated static let previewData = Expression<Data?>("preview_data")
     nonisolated static let ts = Expression<Int64>("timestamp")
@@ -3424,7 +3425,8 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
     /// - 7: 添加 received_from_lan 列（局域网共享接收标记，供 type:lan 过滤）
     /// - 8: 语义向量模型版本升级，清理旧缓存并后台重建
     /// - 9: CJK 统一 word-embedding 向量空间，清理旧缓存并后台重建
-    private static let currentSchemaVersion: Int32 = 9
+    /// - 10: 垃圾箱功能软删除，增加 is_deleted 字段
+    private static let currentSchemaVersion: Int32 = 10
     private static let fileSearchTextBackfillTargetVersion = 1
 
     private func getSchemaVersion() -> Int32 {
@@ -3469,6 +3471,7 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
         let needsCustomTitleMigration = currentVersion < 6
         let needsReceivedFromLanMigration = currentVersion < 7
         let needsSemanticEmbeddingModelMigration = currentVersion < 9
+        let needsIsDeletedMigration = currentVersion < 10
 
         let applyCustomTitleMigrationIfNeeded = { [weak self] in
             guard let self, needsCustomTitleMigration else { return }
@@ -3480,6 +3483,11 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
             guard let self, needsReceivedFromLanMigration else { return }
             self.addReceivedFromLanColumnIfNeeded()
             self.backfillReceivedFromLanFlagsIfNeeded()
+        }
+
+        let applyIsDeletedMigrationIfNeeded = { [weak self] in
+            guard let self, needsIsDeletedMigration else { return }
+            self.addIsDeletedColumnIfNeeded()
         }
 
         // Migration 0 -> 1: 添加 blob_path 列
@@ -3545,11 +3553,12 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
             }
             applyCustomTitleMigrationIfNeeded()
             applyReceivedFromLanMigrationIfNeeded()
+            applyIsDeletedMigrationIfNeeded()
             backfillSemanticEmbeddingsIfNeeded(targetVersion: Self.currentSchemaVersion)
             return migrationStoresLookHealthy()
         }
 
-        if needsTemporaryMigration || needsSourceAnchorMigration || needsEncryptionStateMigration || needsCustomTitleMigration || needsReceivedFromLanMigration || needsSemanticEmbeddingModelMigration {
+        if needsTemporaryMigration || needsSourceAnchorMigration || needsEncryptionStateMigration || needsCustomTitleMigration || needsReceivedFromLanMigration || needsSemanticEmbeddingModelMigration || needsIsDeletedMigration {
             if needsTemporaryMigration {
                 addTemporaryColumnIfNeeded()
             }
@@ -3561,6 +3570,7 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
             }
             applyCustomTitleMigrationIfNeeded()
             applyReceivedFromLanMigrationIfNeeded()
+            applyIsDeletedMigrationIfNeeded()
             if needsSemanticEmbeddingModelMigration {
                 resetSemanticEmbeddingCachesForModelUpgrade()
                 // Persist the schema/model marker immediately after the destructive
@@ -3677,6 +3687,23 @@ final class DeckSQLManager: NSObject, @unchecked Sendable {
             let encryptedValue = DeckUserDefaults.securityModeEnabled ? 1 : 0
             try db.run("UPDATE ClipboardHistory SET is_encrypted = ?", encryptedValue)
             log.info("Added is_encrypted column for encryption state")
+        }
+    }
+
+    private func addIsDeletedColumnIfNeeded() {
+        withDB {
+            guard let db = self.db else { return }
+            let stmt = try db.prepare("PRAGMA table_info(ClipboardHistory)")
+            var columns: [String] = []
+            while let row = try stmt.failableNext() {
+                if let name = row[1] as? String {
+                    columns.append(name)
+                }
+            }
+            if !columns.contains("is_deleted") {
+                try db.run("ALTER TABLE ClipboardHistory ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT 0")
+                log.info("Added is_deleted column for Trash bin support")
+            }
         }
     }
 
@@ -5271,13 +5298,23 @@ extension DeckSQLManager {
         scheduleDatabaseVacuum(reason: "delete all")
     }
 
-    func delete(id: Int64) async {
+    func delete(id: Int64, permanent: Bool = true) async {
         if let count: Int = await withDBAsync({
             guard let db = self.db, let table = self.table else { return 0 }
             let query = table.filter(Col.id == id)
-            return try db.run(query.delete())
+            
+            // First check if we should permanently delete
+            if permanent {
+                let deletedCount = try db.run(query.delete())
+                return deletedCount
+            } else {
+                // Soft delete
+                let update = query.update(Col.isDeleted <- true)
+                let updatedCount = try db.run(update)
+                return updatedCount
+            }
         }) {
-            await log.debug("Deleted item with id \(id): \(count) rows")
+            await log.debug("Deleted/Soft-deleted item with id \(id): \(count) rows")
             invalidateSearchCache(ids: [id])  // 只失效被删除的项
         }
     }
@@ -5555,8 +5592,8 @@ extension DeckSQLManager {
     /// 列表模式下的轻量查询：
     /// - 投影 `data` 列（大内容返回空 BLOB），避免把大 blob materialize 到 Swift Data
     /// - 维持与 UI 一致的排序：timestamp DESC, id DESC
-    private nonisolated func listModeBaseQuery(table: Table) -> Table {
-        table.select(
+    private nonisolated func listModeBaseQuery(table: Table, includeDeleted: Bool = false) -> Table {
+        let query = table.select(
             Col.id,
             Col.uniqueId,
             Col.type,
@@ -5574,8 +5611,14 @@ extension DeckSQLManager {
             Col.blobPath,
             Col.isTemporary,
             Col.isEncrypted,
-            Col.receivedFromLan
+            Col.receivedFromLan,
+            Col.isDeleted
         )
+        if includeDeleted {
+            return query
+        } else {
+            return query.filter(Col.isDeleted == false)
+        }
     }
 
     struct RowCursor: Sendable, Equatable {
@@ -6818,6 +6861,7 @@ extension DeckSQLManager {
             let storedItemType = try row.get(Col.itemType)
             let rawIsTemporary = (try? row.get(Col.isTemporary)) ?? false
             let receivedFromLAN = (try? row.get(Col.receivedFromLan)) ?? false
+            let isDeleted = (try? row.get(Col.isDeleted)) ?? false
             let storedIsEncrypted = try? row.get(Col.isEncrypted)
             let isTemporary = tagId == DeckTag.importantTagId ? false : rawIsTemporary
             
@@ -6920,6 +6964,7 @@ extension DeckSQLManager {
                 contentLength: length,
                 tagId: tagId,
                 isTemporary: isTemporary,
+                isDeleted: isDeleted,
                 receivedFromLAN: receivedFromLAN,
                 id: id,
                 uniqueId: resolvedUniqueId,
@@ -7423,6 +7468,32 @@ extension DeckSQLManager {
         } catch {
             log.warn("Failed to checkpoint WAL: \(error)")
             return false
+        }
+    }
+
+    // MARK: - Trash Bin Queries
+    func fetchDeletedItems(limit: Int = 100, offset: Int = 0) async -> [ClipboardItem] {
+        let rows: [Row] = await withReadDBAsync { db, table in
+            let query = self.listModeBaseQuery(table: table, includeDeleted: true)
+                .filter(Col.isDeleted == true)
+                .order(Col.ts.desc, Col.id.desc)
+                .limit(limit, offset: offset)
+            return Array(try db.prepare(query))
+        } ?? []
+        return await mapRowsToClipboardItems(rows, loadFullData: false)
+    }
+}
+extension DeckSQLManager {
+    func updateIsDeleted(id: Int64, isDeleted: Bool) async {
+        _ = await withDBAsync {
+            guard let db = self.db, let table = self.table else { return 0 }
+            let query = table.filter(Col.id == id)
+            let update = query.update(Col.isDeleted <- isDeleted)
+            let count = (try? db.run(update)) ?? 0
+            if count > 0 {
+                self.invalidateSearchCache(ids: [id])
+            }
+            return count
         }
     }
 }

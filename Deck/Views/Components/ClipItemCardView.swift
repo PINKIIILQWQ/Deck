@@ -469,6 +469,9 @@ struct ClipItemCardView: View {
             .id(contextMenuID)
             .onDrag {
                 createDragItemProvider()
+            } preview: {
+                cardBody
+                    .opacity(0.3)
             }
             .onChange(of: item.searchText) { _, _ in
                 contextMenuID = UUID()
@@ -531,7 +534,19 @@ struct ClipItemCardView: View {
     /// 创建拖拽时的 NSItemProvider
     private func createDragItemProvider() -> NSItemProvider {
         MainWindowController.shared.beginClipItemDragWindowLevelRelaxation()
-        return item.dragItemProvider()
+        let provider = item.dragItemProvider()
+        // 注册内部 item URL，供拖拽到标签功能使用（仅同进程可见）
+        if let itemId = item.id {
+            let urlString = "deckitem://item/\(itemId)"
+            provider.registerDataRepresentation(
+                forTypeIdentifier: UTType.url.identifier,
+                visibility: .ownProcess
+            ) { completion in
+                completion(urlString.data(using: .utf8), nil)
+                return nil
+            }
+        }
+        return provider
     }
 
     // MARK: - Title Editing

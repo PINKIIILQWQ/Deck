@@ -11,6 +11,8 @@ import SwiftUI
 import Foundation
 import AppKit
 import Carbon
+import UniformTypeIdentifiers
+import OSLog
 
 private nonisolated struct IndexedCollection<Base: RandomAccessCollection>: RandomAccessCollection {
     typealias Index = Base.Index
@@ -244,26 +246,30 @@ struct HistoryListView: View {
     }
     
     var body: some View {
-        Group {
-            // Bottom bar:
-            // - Vertical mode: queue bar and action bar are mutually exclusive (same slot)
-            // - Horizontal mode: queue bar has priority, otherwise ambient bar
-            if vm.layoutMode == .vertical {
-                contentSection
-                    .overlay(alignment: .bottom) {
-                        verticalBottomOverlay
-                    }
-            } else {
-                VStack(spacing: 0) {
+        VStack(spacing: 0) {
+            Group {
+                // Bottom bar:
+                // - Vertical mode: queue bar and action bar are mutually exclusive (same slot)
+                // - Horizontal mode: queue bar has priority, otherwise ambient bar
+                if vm.layoutMode == .vertical {
                     contentSection
+                        .overlay(alignment: .bottom) {
+                            verticalBottomOverlay
+                        }
+                } else {
+                    VStack(spacing: 0) {
+                        contentSection
 
-                    if pasteQueue.isQueueMode {
-                        queueStatusBar
-                    } else if !dataStore.items.isEmpty && DeckUserDefaults.showAmbientBar {
-                        ASCIIArtBarView()
+                        if pasteQueue.isQueueMode {
+                            queueStatusBar
+                        } else if !dataStore.items.isEmpty && DeckUserDefaults.showAmbientBar {
+                            ASCIIArtBarView()
+                        }
                     }
                 }
             }
+
+            tagDropBar
         }
         .onAppear {
             setupKeyboardHandlers()
@@ -553,6 +559,19 @@ struct HistoryListView: View {
         }
         .padding(.horizontal, Const.space12)
         .frame(height: bottomBarHeight)
+    }
+
+    /// 标签拖拽接收条 — 拖拽剪贴项到标签上即可快速分配
+    @ViewBuilder
+    private var tagDropBar: some View {
+        let userTags = vm.tags.filter { !$0.isSystem }
+        let importantTag = vm.tags.first(where: { $0.isImportant })
+        if !dataStore.items.isEmpty, !userTags.isEmpty || importantTag != nil {
+            TagDropBarView(
+                userTags: userTags,
+                importantTag: importantTag
+            )
+        }
     }
     
     private var scrollContent: some View {
@@ -2424,6 +2443,275 @@ private struct OverlayToolbarTextButton: View {
         .contentShape(Capsule())
         .onHover { hovering in
             isHovered = hovering
+        }
+    }
+}
+
+// MARK: - Tag Drop Bar
+
+/// 标签拖拽接收条 — 显示在历史列表底部，拖拽剪贴项到标签上即可快速分配
+private struct TagDropBarView: View {
+    let userTags: [DeckTag]
+    let importantTag: DeckTag?
+
+    @State private var hoveredTagId: Int? = nil
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Image(systemName: "tag.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+
+                if let importantTag {
+                    TagDropPill(tag: importantTag, hoveredTagId: $hoveredTagId)
+                }
+
+                ForEach(userTags) { tag in
+                    TagDropPill(tag: tag, hoveredTagId: $hoveredTagId)
+                }
+                
+                Spacer(minLength: 8)
+                
+                DeleteAndTrashComboButton()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+        }
+        .frame(height: 26)
+        .background(.ultraThinMaterial)
+    }
+}
+
+private struct DeleteAndTrashComboButton: View {
+    @State private var isDeleteHovered = false
+    @State private var showTrash = false
+    
+    var body: some View {
+        HStack(spacing: 0) {
+            // Left part: Delete Dropzone
+            Image(systemName: "trash")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(isDeleteHovered ? .white : .primary)
+                .frame(width: 24, height: 20)
+                .background(isDeleteHovered ? Color.red : Color.black.opacity(0.2))
+                .onDrop(of: [.url], isTargeted: $isDeleteHovered) { providers in
+                    defer { isDeleteHovered = false }
+                    guard let provider = providers.first else { return false }
+                    provider.loadDataRepresentation(forTypeIdentifier: UTType.url.identifier) { data, error in
+                        guard let data = data,
+                              let urlString = String(data: data, encoding: .utf8),
+                              let url = URL(string: urlString),
+                              url.scheme == "deckitem",
+                              let itemId = Int64(url.lastPathComponent)
+                        else { return }
+                        DispatchQueue.main.async {
+                            Task {
+                                await DeckSQLManager.shared.delete(id: itemId, permanent: false)
+                                DeckDataStore.shared.loadNextPage() // Refresh list slightly
+                            }
+                        }
+                    }
+                    return true
+                }
+            
+            Divider()
+                .frame(height: 12)
+                .background(Color.white.opacity(0.3))
+            
+            // Right part: Trash Bin Toggle
+            Button {
+                showTrash = true
+            } label: {
+                Image(systemName: "archivebox")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.primary)
+                    .frame(width: 24, height: 20)
+                    .background(Color.black.opacity(0.2))
+            }
+            .buttonStyle(.plain)
+        }
+        .clipShape(Capsule())
+        .popover(isPresented: $showTrash, arrowEdge: .top) {
+            TrashListView()
+                .frame(width: 320, height: 400)
+        }
+    }
+}
+
+private struct TrashListView: View {
+    @State private var deletedItems: [ClipboardItem] = []
+    @State private var itemToDelete: ClipboardItem? = nil
+    
+    var body: some View {
+        VStack {
+            Text("垃圾箱")
+                .font(.headline)
+                .padding(.top)
+            
+            if deletedItems.isEmpty {
+                Text("垃圾箱是空的")
+                    .foregroundColor(.secondary)
+                    .padding()
+                Spacer()
+            } else {
+                List(deletedItems) { item in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.previewText(maxCharacters: 100).text)
+                                .lineLimit(1)
+                                .font(.system(size: 12))
+                            
+                            HStack(spacing: 4) {
+                                Text(item.appName)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                
+                                if item.tagId > 0, let tag = DeckViewModel.shared.tags.first(where: { $0.id == item.tagId }) {
+                                    Circle()
+                                        .fill(tag.color)
+                                        .frame(width: 6, height: 6)
+                                    Text(tag.name)
+                                        .font(.system(size: 10))
+                                        .foregroundColor(tag.color)
+                                }
+                            }
+                        }
+                        Spacer()
+                        Button("恢复") {
+                            restore(item: item)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.2))
+                        .cornerRadius(4)
+                        
+                        Button("彻底删除") {
+                            itemToDelete = item
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(Color.red.opacity(0.2))
+                        .cornerRadius(4)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .onAppear {
+            loadItems()
+        }
+        .alert(item: $itemToDelete) { item in
+            Alert(
+                title: Text("彻底删除"),
+                message: Text("确定要彻底删除这条记录吗？此操作不可撤销。"),
+                primaryButton: .destructive(Text("删除")) {
+                    permanentlyDelete(item: item)
+                },
+                secondaryButton: .cancel(Text("取消"))
+            )
+        }
+    }
+    
+    private func loadItems() {
+        Task {
+            let items = await DeckSQLManager.shared.fetchDeletedItems()
+            DispatchQueue.main.async {
+                self.deletedItems = items
+            }
+        }
+    }
+    
+    private func restore(item: ClipboardItem) {
+        guard let id = item.id else { return }
+        Task {
+            await DeckSQLManager.shared.updateIsDeleted(id: id, isDeleted: false)
+            loadItems()
+            DispatchQueue.main.async {
+                DeckDataStore.shared.loadNextPage()
+            }
+        }
+    }
+    
+    private func permanentlyDelete(item: ClipboardItem) {
+        guard let id = item.id else { return }
+        Task {
+            await DeckSQLManager.shared.delete(id: id, permanent: true)
+            loadItems()
+        }
+    }
+}
+
+/// 单个标签拖拽接收 pill
+private struct TagDropPill: View {
+    let tag: DeckTag
+    @Binding var hoveredTagId: Int?
+
+    private var isDropTargeted: Bool { hoveredTagId == tag.id }
+    private var isOthersTargeted: Bool { hoveredTagId != nil && hoveredTagId != tag.id }
+
+    private var isTargetedBinding: Binding<Bool> {
+        Binding(
+            get: { isDropTargeted },
+            set: { newValue in
+                if newValue {
+                    hoveredTagId = tag.id
+                } else if hoveredTagId == tag.id {
+                    hoveredTagId = nil
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(tag.color)
+                .frame(width: 6, height: 6)
+            Text(tag.name)
+                .font(.system(size: 11, weight: .medium))
+        }
+        .foregroundStyle(isDropTargeted ? tag.color : .secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(
+            Capsule()
+                .fill(isDropTargeted ? tag.color.opacity(0.15) : Color.gray.opacity(0.1))
+        )
+        .overlay(
+            Capsule()
+                .strokeBorder(isDropTargeted ? tag.color.opacity(0.5) : Color.clear, lineWidth: 1)
+        )
+        .scaleEffect(isDropTargeted ? 1.2 : 1.0)
+        .opacity(isOthersTargeted ? 0.3 : 1.0)
+        .animation(.easeInOut(duration: 0.2), value: hoveredTagId)
+        .onDrop(
+            of: [.url],
+            isTargeted: isTargetedBinding
+        ) { providers in
+            defer { hoveredTagId = nil }
+            guard let provider = providers.first else { return false }
+            provider.loadDataRepresentation(
+                forTypeIdentifier: UTType.url.identifier
+            ) { data, error in
+                if let error {
+                    os_log(.error, "TagDropPill: failed to load item URL — %{public}@",
+                           error.localizedDescription)
+                    return
+                }
+                guard let data = data,
+                      let urlString = String(data: data, encoding: .utf8),
+                      let url = URL(string: urlString),
+                      url.scheme == "deckitem",
+                      let itemId = Int64(url.lastPathComponent)
+                else { return }
+                DispatchQueue.main.async {
+                    DeckDataStore.shared.updateItemTag(itemId: itemId, tagId: tag.id)
+                }
+            }
+            return true
         }
     }
 }
